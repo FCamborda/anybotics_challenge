@@ -1,0 +1,41 @@
+services:
+  instance_a:
+    build:
+      context: .
+      dockerfile: Dockerfile.a
+      args:
+        - HOST_UID
+        - HOST_GID
+    container_name: instance_a
+    hostname: instance_a
+    ports:
+      - "2222:22"
+    volumes:
+      - ~/.ssh/ansible_key:/home/ansible/.ssh/id_rsa:ro
+      - ./ansible:/home/ansible/ansible_project
+
+    # Set the working directory inside the container to the Ansible project
+    working_dir: /home/ansible/ansible_project
+    networks:
+      - provisioning_network
+    # Ensure SSH daemon starts, though it's also in the Dockerfile's CMD
+    command: ["/usr/sbin/sshd", "-D"]
+
+  instance_b:
+    build:
+      context: .
+      dockerfile: Dockerfile.b
+    container_name: instance_b
+    hostname: instance_b
+    ports:
+      - "2223:22"
+    networks:
+      - provisioning_network
+    volumes:
+      - ~/.ssh/ansible_key.pub:/home/ansible/.ssh/authorized_keys:ro
+    # Ensure SSH daemon starts
+    command: ["/usr/sbin/sshd", "-D"]
+
+networks:
+  provisioning_network:
+    name: provisioning_network_global

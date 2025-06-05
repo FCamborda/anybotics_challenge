@@ -1,0 +1,138 @@
+- hosts: all
+  remote_user: ansible
+  become: true
+  tasks:
+    # Initial setup to avoid user permission problems
+    - name: Gather getent facts for groups
+      ansible.builtin.getent:
+        database: group
+      register: getent_group_facts
+      changed_when: false
+
+    - name: Gather getent facts for passwd (to get ansible user's GID)
+      ansible.builtin.getent:
+        database: passwd
+        key: ansible
+      register: getent_passwd_facts
+      changed_when: false
+
+    - name: Set fact for ansible user's primary group name
+      ansible.builtin.set_fact:
+        # Get the GID from the ansible user's passwd entry (index 2 in a typical passwd entry)
+        # Then iterate through getent_group_facts to find the group name matching that GID.
+        ansible_user_primary_group_name: |- 
+          {% set target_gid = getent_passwd_facts.ansible_facts.getent_passwd.ansible.2 | string -%}
+          {% set ns = namespace(found_group="") -%}
+          {% for group_name, group_info in getent_group_facts.ansible_facts.getent_group.items() -%}
+            {% if group_info[1] | string == target_gid -%}
+              {% set ns.found_group = group_name -%}
+            {% endif -%}
+          {% endfor -%}
+          {{ ns.found_group | trim }}
+    
+  # Install Docker and Docker Compose
+    - name: install dependencies
+      apt:
+        name: "{{item}}"
+        state: present
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+    - name: add GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+    - name: add docker repository to apt
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+    - name: install docker
+      apt:
+        name: "{{item}}"
+        state: latest
+      loop:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+    - name: check docker is active
+      service:
+        name: docker
+        state: started
+        enabled: yes
+    - name: Ensure group "docker" exists
+      ansible.builtin.group:
+        name: docker
+        state: present
+    - name: adding ansible to docker group
+      user:
+        name: ansible
+        groups: docker
+        append: yes
+    - name: Install docker-compose
+      get_url:
+        url: https://github.com/docker/compose/releases/download/1.29.2/docker-compose-Linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: 'u+x,g+x'
+    - name: Change file ownership, group and permissions
+      ansible.builtin.file:
+        path: /usr/local/bin/docker-compose
+        owner: ansible
+        group: "{{ ansible_user_primary_group_name }}"
+        mode: '0755'
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      become: yes
+      when: ansible_os_family == "Debian"
+
+    # Setup Docker to make instance_a the controller
+    - name: Configure Docker daemon to listen on TCP socket (instance_b)
+      ansible.builtin.copy:
+        content: |
+          {
+            "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"]
+          }
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: '0644'
+      when: inventory_hostname == 'instance_b'
+
+    - name: Stop Docker daemon on instance_b (forcefully by PID and service)
+      ansible.builtin.shell: |
+        if [ -f /var/run/docker.pid ]; then
+          kill $(cat /var/run/docker.pid) || true
+          rm -f /var/run/docker.pid || true
+        fi
+        service docker stop || true
+      when: inventory_hostname == 'instance_b'
+
+    - name: Start Docker daemon directly with configured hosts on instance_b
+      ansible.builtin.shell: |
+        nohup dockerd --config-file /etc/docker/daemon.json > /var/log/dockerd.log 2>&1 &
+      async: 1
+      poll: 0
+      when: inventory_hostname == 'instance_b'
+   
+    - name: Wait for Docker daemon to be listening on port 2375 (on instance_b)
+      ansible.builtin.wait_for:
+        port: 2375
+        host: "{{ ansible_host }}"
+        state: started
+        timeout: 90
+      when: inventory_hostname == 'instance_b'
+
+    - name: Automate DOCKER_HOST environment variable for ansible user (on instance_a)
+      ansible.builtin.lineinfile:
+        path: /home/ansible/.bashrc
+        line: 'export DOCKER_HOST=tcp://instance_b:2375'
+        create: yes
+        insertafter: EOF
+        owner: ansible
+        group: "{{ ansible_user_primary_group_name }}"
+        mode: '0644'
+      when: inventory_hostname == 'instance_a'

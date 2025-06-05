@@ -1,0 +1,56 @@
+FROM ubuntu:latest
+
+ARG HOST_UID
+ARG HOST_GID
+
+RUN apt-get update && \
+    apt-get install -y openssh-server openssh-client python3 python3-pip ansible && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- UPDATED SECTION FOR USER AND GROUP CREATION ---
+# This section ensures the 'ansible' user is created with the specified HOST_UID,
+# and its primary group aligns with HOST_GID, even if that GID is already in use
+# by a different group name in the base image.
+RUN set -eux; \
+    PRIMARY_GROUP_NAME="ansible"; \
+    EXISTING_GROUP_NAME_BY_HOST_GID=$(getent group ${HOST_GID} | cut -d: -f1); \
+    if [ -n "$EXISTING_GROUP_NAME_BY_HOST_GID" ]; then \
+        # GID is taken, use the existing group name as primary for 'ansible' user
+        PRIMARY_GROUP_NAME="$EXISTING_GROUP_NAME_BY_HOST_GID"; \
+    else \
+        # GID is free, create 'ansible' group with this GID
+        groupadd -g ${HOST_GID} ansible; \
+    fi; \
+    \
+    # Create the user 'ansible' with the HOST_UID and assign to the determined primary group
+    useradd -u ${HOST_UID} -g ${PRIMARY_GROUP_NAME} -m -s /bin/bash ansible; \
+    echo "ansible:ansible" | chpasswd; \
+    \
+    # Add 'ansible' user to the 'sudo' group
+    usermod -aG sudo ansible; \
+    \
+    # Additionally, ensure 'ansible' user is also a member of the group that *does* have HOST_GID,
+    # if it's different from their primary group (e.g., if PRIMARY_GROUP_NAME was not 'ansible').
+    if [ -n "$EXISTING_GROUP_NAME_BY_HOST_GID" ] && [ "$PRIMARY_GROUP_NAME" != "ansible" ]; then \
+        usermod -aG "$EXISTING_GROUP_NAME_BY_HOST_GID" ansible; \
+    fi
+# Configure SSH for the 'ansible' user to allow key-based authentication
+# Removed 'chown ansible:ansible' from here as it's handled by entrypoint.sh at runtime
+RUN mkdir -p /home/ansible/.ssh && \
+    chmod 700 /home/ansible/.ssh
+
+# Configure SSH daemon settings:
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+RUN sed -i 's/UsePAM yes/UsePAM no/' /etc/ssh/sshd_config
+
+RUN mkdir -p /run/sshd
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 22
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/usr/sbin/sshd", "-D"]
