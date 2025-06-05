@@ -89,6 +89,20 @@
       become: yes
       when: ansible_os_family == "Debian"
 
+    - name: Install Docker SDK for Python using apt
+      ansible.builtin.apt:
+        name: python3-docker
+        state: present
+      become: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install docker-compose Python library using apt
+      ansible.builtin.apt:
+        name: python3-compose
+        state: present
+      become: yes
+      when: ansible_os_family == "Debian"
+
     # Setup Docker to make instance_a the controller
     - name: Configure Docker daemon to listen on TCP socket (instance_b)
       ansible.builtin.copy:
@@ -136,3 +150,83 @@
         group: "{{ ansible_user_primary_group_name }}"
         mode: '0644'
       when: inventory_hostname == 'instance_a'
+
+    # FIXME: This should not be needed if we rely on docker compose, but something is off
+    - name: Create shared network on instance_b's Docker daemon
+      ansible.builtin.shell: |
+        export DOCKER_HOST=tcp://instance_b:2375
+        docker network create --attachable provisioning_network_global || true
+      when: inventory_hostname == 'instance_a'
+
+    # App deployment
+    - name: Create application directory on instance_a
+      ansible.builtin.file:
+        path: /home/ansible/apps
+        state: directory
+        owner: ansible
+        group: "{{ ansible_user_primary_group_name }}"
+        mode: '0755'
+      when: inventory_hostname == 'instance_a'
+
+    - name: Copy echo-compose.yaml to instance_a
+      ansible.builtin.copy:
+        src: ./echo-compose.yaml
+        dest: /home/ansible/apps/echo-compose.yaml
+        owner: ansible
+        group: "{{ ansible_user_primary_group_name }}"
+        mode: '0644'
+      when: inventory_hostname == 'instance_a'
+
+    - name: Deploy http-https-echo on instance_b (orchestrated from instance_a)
+      ansible.builtin.shell: |
+        export DOCKER_HOST=tcp://instance_b:2375
+        docker compose -f /home/ansible/apps/echo-compose.yaml up -d
+      args:
+        chdir: /home/ansible/apps
+      when: inventory_hostname == 'instance_a'
+
+    # Copy needed config files to be accessible by instance_b
+    - name: Ensure Nginx deployment directory exists on instance_a
+      ansible.builtin.file:
+        path: /home/ansible/ansible_project/nginx_host_docker_configs
+        state: directory
+        owner: ansible
+        group: "{{ ansible_user_primary_group_name }}"
+        mode: '0755'
+      when: inventory_hostname == 'instance_a'
+
+    - name: Copy nginx.conf to the host-mounted directory
+      ansible.builtin.copy:
+        src: nginx.conf
+        dest: /home/ansible/ansible_project/nginx_host_docker_configs/nginx.conf
+        mode: '0644'
+      when: inventory_hostname == 'instance_a'
+
+    - name: Deploy Nginx using docker_container module (docker compose fails)
+      community.docker.docker_container:
+        name: nginx_ansible_direct_test
+        image: nginx:latest
+        state: started
+        restart_policy: always
+        docker_host: "unix:///var/run/host_docker.sock"
+        ports:
+          - "80:80"
+        volumes:
+          # FIXME: Use relative path
+          - "/Users/franco/git/anybotics_challenge/ansible/nginx_host_docker_configs/nginx.conf:/etc/nginx/nginx.conf:ro"
+        networks:
+          - name: provisioning_network_global
+      when: inventory_hostname == 'instance_a'
+
+    # Verification of deployment
+    - name: Test Nginx proxying to http-echo (from instance_a to host's port 80)
+      ansible.builtin.uri:
+        url: "http://host.docker.internal:80"
+        return_content: yes
+      register: nginx_proxy_test
+      when: inventory_hostname == 'instance_a'
+
+    - name: Print Nginx proxy test output
+      ansible.builtin.debug:
+        msg: "Nginx proxy test output: {{ nginx_proxy_test.content | default('Failed to curl') }}"
+      when: inventory_hostname == 'instance_a' and nginx_proxy_test is defined

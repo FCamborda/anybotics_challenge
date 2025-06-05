@@ -1,0 +1,15 @@
+services:
+  http-echo:
+    image: mendhak/http-https-echo:latest
+    ports:
+      # Expose port 8080 from the container to instance_b's network interface.
+      # This makes it accessible via instance_b's internal IP/hostname on the network.
+      - "8080:8080"
+    container_name: http-echo-b
+    restart: always # Keep the service running
+    networks:
+      - provisioning_network_global
+
+networks:
+  provisioning_network_global:
+    external: true
